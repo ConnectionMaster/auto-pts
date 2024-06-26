@@ -16,13 +16,16 @@
 import collections
 import datetime
 import importlib
+import logging
 import os
 import subprocess
 import sys
 import time
+import traceback
 from pathlib import Path
 
 from autopts import bot
+from autopts.bot.common import BuildAndFlashException
 from autopts.bot.common_features.github import update_sources
 from autopts.client import Client
 from autopts.ptsprojects.boards import release_device, get_build_and_flash, get_board_type
@@ -93,27 +96,35 @@ def compose_mail(args, mail_cfg, mail_ctx):
     """ Create a email body
     """
 
-    body = '''
+    additional_info = ''
+    if 'additional_info_path' in mail_cfg:
+        try:
+            with open(mail_cfg['additional_info_path']) as file:
+                additional_info = f'{file.read()} <br>'
+        except Exception as e:
+            logging.exception(e)
+
+    body = f'''
     <p>This is automated email and do not reply.</p>
     <h1>Bluetooth test session</h1>
+    {additional_info}
     <h2>1. IUT Setup</h2>
-    <b> Board:</b> {} <br>
-    <b> Source:</b> {} </p>
+    <b> Board:</b> {args["board"]} <br>
+    <b> Source:</b> {mail_ctx["mynewt_repo_status"]} </p>
     <h2>2. PTS Setup</h2>
     <p><b> OS:</b> Windows 10 <br>
-    <b> Platform:</b> {} <br>
-    <b> Version:</b> {} </p>
+    <b> Platform:</b> {args['platform']} <br>
+    <b> Version:</b> {args['pts_ver']} </p>
     <h2>3. Test Results</h2>
-    <p><b>Execution Time</b>: {}</p>
-    {}
-    {}
+    <p><b>Execution Time</b>: {mail_ctx["elapsed_time"]}</p>
+    {mail_ctx["summary"]}
+    {mail_ctx["regression"]}
+    {mail_ctx["progresses"]}
     <h3>Logs</h3>
-    {}
+    {mail_ctx["log_url"]}
     <p>Sincerely,</p>
-    <p> {}</p>
-    '''.format(args["board"], mail_ctx["mynewt_repo_status"], args['platform'],
-               args['pts_ver'], mail_ctx["elapsed_time"], mail_ctx["summary"],
-               mail_ctx["regression"], mail_ctx["log_url"], mail_cfg['name'])
+    <p> {mail_cfg['name']}</p>
+'''
 
     if 'subject' in mail_cfg:
         subject = mail_cfg['subject']
@@ -160,9 +171,10 @@ class MynewtBotClient(bot.common.BotClient):
 
             try:
                 build_and_flash(args.project_path, board_type, overlay, args.debugger_snr)
-            except:
+            except BaseException as e:
+                traceback.print_exception(e)
                 report.make_error_txt('Build and flash step failed')
-                raise
+                raise BuildAndFlashException
 
             time.sleep(10)
 
@@ -257,6 +269,8 @@ def main(bot_client):
         mail_ctx = {"summary": mail.status_dict2summary_html(summary),
                     "regression": mail.regressions2html(regressions,
                                                         descriptions),
+                    "progresses": mail.progresses2html(progresses,
+                                                       descriptions),
                     "mynewt_repo_status": repo_status}
 
         # Summary
@@ -272,7 +286,7 @@ def main(bot_client):
 
         # Elapsed Time
         mail_ctx["elapsed_time"] = str(datetime.timedelta(
-            seconds=(end_time - start_time)))
+            seconds=(int(end_time - start_time))))
 
         subject, body = compose_mail(args, cfg['mail'], mail_ctx)
 

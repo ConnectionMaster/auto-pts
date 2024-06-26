@@ -19,11 +19,13 @@ import os
 import subprocess
 import sys
 import shutil
+import time
 
 from pathlib import Path
 from argparse import Namespace
 from autopts import client as autoptsclient
-from autopts.client import CliParser, Client, TestCaseRunStats, init_logging
+from autopts.client import CliParser, Client, TestCaseRunStats, init_logging, TEST_CASE_DB
+from autopts.config import MAX_SERVER_RESTART_TIME
 from autopts.ptsprojects.boards import get_free_device, get_tty, get_debugger_snr
 from autopts.ptsprojects.testcase_db import DATABASE_FILE
 
@@ -33,6 +35,10 @@ PROJECT_DIR = os.path.dirname(  # auto-pts repo directory
                         os.path.abspath(__file__))))  # this file directory
 
 log = logging.debug
+
+
+class BuildAndFlashException(Exception):
+    pass
 
 
 class BotCliParser(CliParser):
@@ -66,6 +72,7 @@ class BotConfigArgs(Namespace):
         self.local_addr = args.get('local_ip', ['127.0.0.1'] * len(self.cli_port))
         self.server_count = args.get('server_count', len(self.cli_port))
         self.tty_file = args.get('tty_file', None)
+        self.tty_alias = args.get('tty_alias', None)
         self.debugger_snr = args.get('debugger_snr', None)
         self.kernel_image = args.get('kernel_image', None)
         self.database_file = args.get('database_file', DATABASE_FILE)
@@ -79,8 +86,10 @@ class BotConfigArgs(Namespace):
         self.bd_addr = args.get('bd_addr', '')
         self.enable_max_logs = args.get('enable_max_logs', False)
         self.retry = args.get('retry', 0)
+        self.repeat_until_fail = args.get('repeat_until_fail', False)
         self.stress_test = args.get('stress_test', False)
         self.ykush = args.get('ykush', None)
+        self.ykush_replug_delay = args.get('ykush_replug_delay', 3)
         self.recovery = args.get('recovery', False)
         self.superguard = float(args.get('superguard', 0))
         self.cron_optim = args.get('cron_optim', False)
@@ -88,6 +97,8 @@ class BotConfigArgs(Namespace):
         self.test_case_limit = args.get('test_case_limit', 0)
         self.simple_mode = args.get('simple_mode', False)
         self.server_args = args.get('server_args', None)
+        self.pylink_reset = args.get('pylink_reset', False)
+        self.max_server_restart_time = args.get('max_server_restart_time', MAX_SERVER_RESTART_TIME)
 
         if self.server_args is not None:
             from autoptsserver import SvrArgumentParser
@@ -119,7 +130,9 @@ class BotClient(Client):
         self.iut_config = None
 
     def parse_or_find_tty(self, args):
-        if args.tty_file is None:
+        if args.tty_alias:
+            args.tty_file = args.tty_alias
+        elif args.tty_file is None:
             if args.debugger_snr is None:
                 args.tty_file, args.debugger_snr = get_free_device(args.board_name)
             else:
@@ -153,59 +166,11 @@ class BotClient(Client):
         pass
 
     def run_test_cases(self):
-        _args = {}
         limit_counter = 0
         all_stats = None
 
-        config_default = self.config_default
-        _args[config_default] = self.args
-
-        # These contain values passed with -c and -e options
-        included = sort_and_reduce_prefixes(_args[config_default].test_cases)
-        excluded = sort_and_reduce_prefixes(_args[config_default].excluded)
-        _args[config_default].excluded = []
-        _args[config_default].test_cases = []
-
-        # Ask the PTS about test cases available in the workspace
-        filtered_test_cases = autoptsclient.get_test_cases(self.ptses[0], included, excluded)
-
-        # Save the iut_config key run order.
-        run_order = list(self.iut_config.keys())
-
-        # Make sure that default config is processed last and gets from the remaining test cases
-        distribution_order = copy.deepcopy(run_order)
-        if config_default in run_order:
-            distribution_order.remove(config_default)
-            distribution_order.append(config_default)
-
-        # Distribute test cases among .conf files
-        remaining_test_cases = copy.deepcopy(filtered_test_cases)
-        for config in distribution_order:
-            value = self.iut_config[config]
-
-            # Merge .confs without 'test_cases' into the default one
-            if 'test_cases' not in value:
-                # The 'test_cases' can be skipped only in the default config.
-                # It means: Run all remaining after distribution test cases
-                # with the default config.
-                continue
-
-            _args[config] = copy.deepcopy(_args[config_default])
-
-            for prefix in value['test_cases']:
-                for tc in filtered_test_cases:
-                    if tc.startswith(prefix):
-                        _args[config].test_cases.append(tc)
-                        remaining_test_cases.remove(tc)
-
-                filtered_test_cases = copy.deepcopy(remaining_test_cases)
-
-        # Remaining test cases will be run with the default .conf file
-        # if default .conf doesn't have already defined test cases
-        if len(_args[config_default].test_cases) == 0 and \
-                config_default in self.iut_config and \
-                len(self.iut_config[config_default].get('test_cases', [])) == 0:
-            _args[config_default].test_cases = filtered_test_cases
+        run_order, _args = get_filtered_test_cases(self.iut_config, self.args,
+                                                   self.config_default, self.ptses[0])
 
         for config in run_order:
             if _args.get(config) is None:
@@ -229,9 +194,17 @@ class BotClient(Client):
 
                 limit_counter += test_case_number
 
-            self.apply_config(_args[config], config, self.iut_config[config])
+            try:
+                self.apply_config(_args[config], config, self.iut_config[config])
 
-            stats = autoptsclient.run_test_cases(self.ptses, self.test_cases, _args[config])
+                stats = autoptsclient.run_test_cases(self.ptses, self.test_cases, _args[config])
+            except BuildAndFlashException:
+                log(f'Build and flash step failed for config {config}')
+                stats = TestCaseRunStats(self.ptses[0].get_project_list(),
+                                         _args[config].test_cases, 0, TEST_CASE_DB)
+                for tc in _args[config].test_cases:
+                    status = 'BUILD_OR_FLASH ERROR'
+                    stats.update(tc, time.time(), status)
 
             if all_stats is None:
                 all_stats = stats
@@ -274,6 +247,61 @@ class BotClient(Client):
         return super().start()
 
 
+def get_filtered_test_cases(iut_config, bot_args, config_default, pts):
+    _args = {}
+    config_default = config_default
+    _args[config_default] = bot_args
+
+    # These contain values passed with -c and -e options
+    included = sort_and_reduce_prefixes(_args[config_default].test_cases)
+    excluded = sort_and_reduce_prefixes(_args[config_default].excluded)
+    _args[config_default].excluded = []
+    _args[config_default].test_cases = []
+
+    # Ask the PTS about test cases available in the workspace
+    filtered_test_cases = autoptsclient.get_test_cases(pts, included, excluded)
+
+    # Save the iut_config key run order.
+    run_order = list(iut_config.keys())
+
+    # Make sure that default config is processed last and gets from the remaining test cases
+    distribution_order = copy.deepcopy(run_order)
+    if config_default in run_order:
+        distribution_order.remove(config_default)
+        distribution_order.append(config_default)
+
+    # Distribute test cases among .conf files
+    remaining_test_cases = copy.deepcopy(filtered_test_cases)
+    for config in distribution_order:
+        value = iut_config[config]
+
+        # Merge .confs without 'test_cases' into the default one
+        if 'test_cases' not in value:
+            # The 'test_cases' can be skipped only in the default config.
+            # It means: Run all remaining after distribution test cases
+            # with the default config.
+            continue
+
+        _args[config] = copy.deepcopy(_args[config_default])
+
+        for prefix in value['test_cases']:
+            for tc in filtered_test_cases:
+                if tc.startswith(prefix):
+                    _args[config].test_cases.append(tc)
+                    remaining_test_cases.remove(tc)
+
+            filtered_test_cases = copy.deepcopy(remaining_test_cases)
+
+    # Remaining test cases will be run with the default .conf file
+    # if default .conf doesn't have already defined test cases
+    if len(_args[config_default].test_cases) == 0 and \
+            config_default in iut_config and \
+            len(iut_config[config_default].get('test_cases', [])) == 0:
+        _args[config_default].test_cases = filtered_test_cases
+
+    return run_order, _args
+
+
 def sort_and_reduce_prefixes(prefixes):
     sorted_prefixes = sorted(prefixes, key=len)
     final_prefixes = []
@@ -312,6 +340,7 @@ def check_call(cmd, env=None, cwd=None, shell=True):
         executable = None
 
     logging.debug(f'Running cmd: {cmd}')
+    sys.stdout.flush()
 
     return subprocess.check_call(cmd, env=env, cwd=cwd, shell=shell, executable=executable)
 

@@ -19,9 +19,11 @@
 import collections
 import datetime
 import importlib
+import logging
 import os
 import sys
 import time
+import traceback
 from pathlib import Path
 
 import serial
@@ -31,7 +33,7 @@ from autopts.bot.common_features.github import update_sources
 from autopts.ptsprojects.zephyr import ZEPHYR_PROJECT_URL
 from autopts import client as autoptsclient
 
-from autopts.bot.common import BotConfigArgs, BotClient
+from autopts.bot.common import BotConfigArgs, BotClient, BuildAndFlashException
 from autopts.ptsprojects.boards import tty_to_com, release_device, get_build_and_flash, get_board_type
 from autopts.ptsprojects.testcase_db import DATABASE_FILE
 from autopts.ptsprojects.zephyr.iutctl import get_iut, log
@@ -118,12 +120,21 @@ def compose_mail(args, mail_cfg, mail_ctx):
     """ Create a email body
     """
 
+    additional_info = ''
+    if 'additional_info_path' in mail_cfg:
+        try:
+            with open(mail_cfg['additional_info_path']) as file:
+                additional_info = f'{file.read()} <br>'
+        except Exception as e:
+            logging.exception(e)
+
     iso_cal = datetime.date.today().isocalendar()
     ww_dd_str = "WW%s.%s" % (iso_cal[1], iso_cal[2])
 
     body = f'''
     <p>This is automated email and do not reply.</p>
     <h1>Bluetooth test session - {ww_dd_str} </h1>
+    {additional_info}
     <h2>1. IUT Setup</h2>
     <p><b> Type:</b> Zephyr <br>
     <b> Board:</b> {args['board']} <br>
@@ -205,9 +216,10 @@ class ZephyrBotClient(BotClient):
                                 overlays, args.project_repos)
 
                 flush_serial(args.tty_file)
-            except:
+            except BaseException as e:
+                traceback.print_exception(e)
                 report.make_error_txt('Build and flash step failed')
-                raise
+                raise BuildAndFlashException
 
             time.sleep(10)
 
@@ -353,7 +365,7 @@ def main(bot_client):
 
         # Elapsed Time
         mail_ctx["elapsed_time"] = str(datetime.timedelta(
-            seconds=(end_time - start_time)))
+            seconds=(int(end_time - start_time))))
 
         subject, body = compose_mail(args, cfg['mail'], mail_ctx)
 

@@ -245,6 +245,27 @@ def count_script_instances(script_name):
     return count
 
 
+def terminate_process(pid=None, name=None, cmdline=None):
+    if pid is None and name is None and cmdline is None:
+        logging.debug('No arguments provided')
+        return
+
+    for process in psutil.process_iter(['pid', 'name', 'cmdline']):
+        if pid and pid != process.info["pid"]:
+            continue
+
+        if name and (process.info["name"] or name not in process.info["name"]):
+            continue
+
+        if cmdline and (not process.info["cmdline"] or
+           cmdline not in ' '.join(process.info["cmdline"])):
+            continue
+
+        process.terminate()
+        logging.debug(f"The process with pid={process.info['pid']} name={process.info['name']} "
+                      f"cmdline={process.info['cmdline']} has been terminated.")
+
+
 class AdminStateUnknownError(Exception):
     pass
 
@@ -288,6 +309,9 @@ else:
             import pyudev
             _pyudev = pyudev
 
+        if os.path.islink(serial_address):
+            serial_address = os.path.realpath(serial_address)
+
         context = _pyudev.Context()
         for device in context.list_devices(subsystem=subsystem):
             try:
@@ -320,6 +344,7 @@ def ykush_replug_usb(ykush_config, device_id=None, delay=0, end_flag=None):
         usb_power(ykush_port, False, ykush_srn)
         sleep(delay)
         usb_power(ykush_port, True, ykush_srn)
+        sleep(delay)
         return
 
     i = 0

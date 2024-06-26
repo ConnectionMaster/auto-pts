@@ -43,7 +43,7 @@ from autopts.ptsprojects.ptstypes import E_FATAL_ERROR
 from autopts.ptsprojects.testcase import PTSCallback, TestCaseLT1, TestCaseLT2, TestCaseLT3
 from autopts.ptsprojects.testcase_db import TestCaseTable
 from autopts.pybtp import btp, defs
-from autopts.pybtp.types import BTPError, SynchError
+from autopts.pybtp.types import BTPError, SynchError, MissingWIDError
 from autopts.utils import InterruptableThread, ResultWithFlag, CounterWithFlag, set_global_end, \
     raise_on_global_end, RunEnd, get_global_end, have_admin_rights, ykush_replug_usb
 from cliparser import CliParser
@@ -55,13 +55,6 @@ RUNNING_TEST_CASE = {}
 TEST_CASE_DB = None
 autoprojects = None
 TEST_CASE_TIMEOUT_MS = 300000  # milliseconds
-RESTART_PTS_TIMEOUT_S = 60  # seconds
-
-# The number of seconds to wait for autoptsserver restart.
-# - during normal recovery:
-MIN_SERVER_RESTART_TIME = 40
-# - during recovery of recovery
-MAX_SERVER_RESTART_TIME = 60
 
 # To test autopts client locally:
 # Envrinment variable AUTO_PTS_LOCAL must be set for FakeProxy to
@@ -88,7 +81,8 @@ class PtsServerProxy(xmlrpc.client.ServerProxy):
         self.callback = None
 
     @staticmethod
-    def factory_get_instance(_id, server_address, server_port, client_address, client_port):
+    def factory_get_instance(_id, server_address, server_port,
+                             client_address, client_port, timeout):
         proxy = proxy = PtsServerProxy(server_address, server_port)
         result = ResultWithFlag(False)
         print(f"{id(proxy)} Starting PTS: {proxy.info} ...")
@@ -102,7 +96,7 @@ class PtsServerProxy(xmlrpc.client.ServerProxy):
             # Continue waiting
             return True
 
-        result.wait(timeout=RESTART_PTS_TIMEOUT_S, predicate=wait_for)
+        result.wait(timeout=timeout, predicate=wait_for)
 
         log("Server methods: %s", proxy.system.listMethods())
         proxy.callback_thread = ClientCallbackServer(client_port, f'LT{_id}-callback')
@@ -155,7 +149,7 @@ class PtsServer(Server):
         self.info = f'builtin {_args.srv_port}'
 
     @staticmethod
-    def factory_get_instance(args):
+    def factory_get_instance(args, timeout):
         proxy = PtsServer(args)
         proxy.start()
 
@@ -169,7 +163,7 @@ class PtsServer(Server):
             return True
 
         try:
-            result.wait(timeout=RESTART_PTS_TIMEOUT_S, predicate=wait_for)
+            result.wait(timeout=timeout, predicate=wait_for)
             if not result.get_nowait():
                 raise Exception('Failed to start autoptsserver')
         except BaseException:
@@ -437,8 +431,8 @@ def init_logging(tag=""):
 
 def init_pts_thread_entry_wrapper(func):
     def wrapper(*args):
-        exceptions = args[4]
-        counter = args[5]
+        exceptions = args[2]
+        counter = args[3]
         try:
             func(*args)
         except Exception as exc:
@@ -451,8 +445,7 @@ def init_pts_thread_entry_wrapper(func):
 
 
 @init_pts_thread_entry_wrapper
-def init_pts_thread_entry(proxy, workspace_path, bd_addr,
-                          enable_max_logs, exceptions, finish_count):
+def init_pts_thread_entry(proxy, args, exceptions, finish_count):
     """PTS instance initialization thread function entry"""
 
     sys.stdout.flush()
@@ -461,7 +454,7 @@ def init_pts_thread_entry(proxy, workspace_path, bd_addr,
     if err != "WAIT":
         raise Exception("Failed to restart PTS!")
 
-    err = proxy.callback.get_result('restart_pts', timeout=RESTART_PTS_TIMEOUT_S)
+    err = proxy.callback.get_result('restart_pts', timeout=args.max_server_restart_time)
     if err != True:
         raise Exception(f"Failed to restart PTS, err {err}")
 
@@ -473,16 +466,16 @@ def init_pts_thread_entry(proxy, workspace_path, bd_addr,
     proxy.q_bd_addr = proxy.bd_addr()
     log("PTS BD_ADDR: %s", proxy.q_bd_addr)
 
-    log("Opening workspace: %s", workspace_path)
-    proxy.open_workspace(workspace_path)
+    log("Opening workspace: %s", args.workspace)
+    proxy.open_workspace(args.workspace)
 
-    if bd_addr:
+    if args.bd_addr:
         projects = proxy.get_project_list()
         for project_name in projects:
-            log("Set bd_addr PIXIT: %s for project: %s", bd_addr, project_name)
-            proxy.update_pixit_param(project_name, "TSPX_bd_addr_iut", bd_addr)
+            log("Set bd_addr PIXIT: %s for project: %s", args.bd_addr, project_name)
+            proxy.update_pixit_param(project_name, "TSPX_bd_addr_iut", args.bd_addr)
 
-    proxy.enable_maximum_logging(enable_max_logs)
+    proxy.enable_maximum_logging(args.enable_max_logs)
 
 
 def init_pts(args, ptses, tc_db_table_name=None):
@@ -505,18 +498,18 @@ def init_pts(args, ptses, tc_db_table_name=None):
             if AUTO_PTS_LOCAL:
                 proxy = FakeProxy()
             elif getattr(args, 'server_args', False):
-                proxy = PtsServer.factory_get_instance(args.server_args[i])
+                proxy = PtsServer.factory_get_instance(args.server_args[i], args.max_server_restart_time)
             else:
                 proxy = PtsServerProxy.factory_get_instance(
                     i+1, args.ip_addr[i], args.srv_port[i],
-                    args.local_addr[i], args.cli_port[i])
+                    args.local_addr[i], args.cli_port[i],
+                    args.max_server_restart_time)
 
             proxy_list.append(proxy)
 
         thread = InterruptableThread(target=init_pts_thread_entry,
                                      name=f'LT{i+1}-server-init',
-                                     args=(proxy, args.workspace, args.bd_addr,
-                                           args.enable_max_logs, exceptions, finish_count))
+                                     args=(proxy, args, exceptions, finish_count))
 
         thread_list.append(thread)
         thread.start()
@@ -525,9 +518,10 @@ def init_pts(args, ptses, tc_db_table_name=None):
         global TEST_CASE_DB
         TEST_CASE_DB = TestCaseTable(tc_db_table_name, args.database_file)
 
-    # Wait till every PTS instance finish executing its test case
+    # Wait until each PTS instance is initialized.
     try:
-        finish_count.wait_for(thread_count, timeout=180.0)
+        finish_count.wait_for(thread_count, timeout=max(
+            180.0, server_count * args.max_server_restart_time))
     except Exception as e:
         logging.exception(e)
         raise
@@ -836,6 +830,8 @@ def run_test_case_wrapper(func):
         else:
             print(result)
 
+        sys.stdout.flush()
+
         return status, end_time
 
     return wrapper
@@ -853,6 +849,9 @@ def get_error_code(exc):
 
     elif isinstance(exc, xmlrpc.client.Fault):
         error_code = ptstypes.E_XML_RPC_ERROR
+
+    elif isinstance(exc, MissingWIDError):
+        error_code = ptstypes.E_MISSING_WID_ERROR
 
     elif error_code is None:
         error_code = ptstypes.E_FATAL_ERROR
@@ -1165,6 +1164,27 @@ test_case_blacklist = [
 ]
 
 
+def run_or_not(test_case_name, test_cases, excluded):
+    for entry in test_case_blacklist:
+        if entry in test_case_name:
+            return False
+
+    if excluded:
+        for n in excluded:
+            if test_case_name.startswith(n):
+                return False
+
+    if test_cases:
+        for n in test_cases:
+            if test_case_name.startswith(n):
+                return True
+
+        return False
+
+    # Empty test_cases means "run them all"
+    return True
+
+
 def get_test_cases(pts, test_cases, excluded):
     """
     param: pts: proxy to initiated pts instance
@@ -1174,33 +1194,13 @@ def get_test_cases(pts, test_cases, excluded):
     param: excluded: test cases specified with -e option
     """
 
-    def run_or_not(test_case_name):
-        for entry in test_case_blacklist:
-            if entry in test_case_name:
-                return False
-
-        if excluded:
-            for n in excluded:
-                if test_case_name.startswith(n):
-                    return False
-
-        if test_cases:
-            for n in test_cases:
-                if test_case_name.startswith(n):
-                    return True
-
-            return False
-
-        # Empty test_cases means "run them all"
-        return True
-
     projects = pts.get_project_list()
 
     _test_cases = []
 
     for project in projects:
         _test_case_list = pts.get_test_case_list(project)
-        _test_cases += [tc for tc in _test_case_list if run_or_not(tc)]
+        _test_cases += [tc for tc in _test_case_list if run_or_not(tc, test_cases, excluded)]
 
     return _test_cases
 
@@ -1220,6 +1220,7 @@ def run_test_cases(ptses, test_case_instances, args):
     test_cases = args.test_cases
     projects = ptses[0].get_project_list()
     retry_config = getattr(args, 'retry_config', None)
+    repeat_until_failed = getattr(args, 'repeat_until_fail', False)
 
     # Statistics
     stats = TestCaseRunStats(projects, test_cases, args.retry, TEST_CASE_DB)
@@ -1258,6 +1259,9 @@ def run_test_cases(ptses, test_case_instances, args):
                 retry_limit = test_retry_count
             else:
                 retry_limit = args.retry
+
+            if repeat_until_failed and status == 'PASS':
+                continue
 
             if (status == 'PASS' and not args.stress_test) or \
                     stats.run_count == retry_limit:
@@ -1422,7 +1426,7 @@ def recover_at_exception(func):
      jammed/crashed, but there is still a chance it will be recovered."""
 
     def _recover_at_exception(*args, **kwargs):
-        restart_time = MAX_SERVER_RESTART_TIME
+        restart_time = args[0].max_server_restart_time
 
         while not get_global_end():
             try:
@@ -1455,23 +1459,42 @@ def run_recovery(args, ptses):
     if args.ykush:
         if sys.platform == 'win32':
             device_id = tty_to_com(args.tty_file)
+        elif args.tty_alias:
+            device_id = args.tty_alias
         else:
             device_id = args.tty_file
 
-        ykush_replug_usb(args.ykush, device_id=device_id)
+        ykush_replug_usb(args.ykush, device_id=device_id, delay=args.ykush_replug_delay)
+
+        if args.tty_alias:
+            while not os.path.islink(args.tty_alias) and not os.path.exists(os.path.realpath(args.tty_alias)):
+                raise_on_global_end()
+                log(f'Waiting for TTY {args.tty_alias} to appear...\n')
+                time.sleep(1)
+
+            args.tty_file = os.path.realpath(args.tty_alias)
 
     for pts in ptses:
         req_sent = False
+        last_restart_time = None
+
         while not get_global_end():
             try:
+                if not last_restart_time:
+                    last_restart_time = pts.get_last_recovery_time()
+                    log(f'Last restart time of PTS {pts}: {last_restart_time}')
+
                 if not req_sent:
                     log(f'Recovering PTS {pts} ...')
                     pts.recover_pts()
                     req_sent = True
+                    err = pts.callback.get_result('recover_pts', timeout=args.max_server_restart_time)
+                    if err == True:
+                        break
 
-                err = pts.callback.get_result('recover_pts', timeout=RESTART_PTS_TIMEOUT_S)
-                if err == True:
+                if last_restart_time < pts.get_last_recovery_time():
                     break
+
             except Exception:
                 log('Server is still resetting. Wait a little more.')
                 time.sleep(1)

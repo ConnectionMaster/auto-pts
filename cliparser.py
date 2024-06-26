@@ -15,14 +15,16 @@
 # more details.
 #
 import argparse
+import logging
 import os
 import time
 
 from distutils.spawn import find_executable
-from autopts.config import SERVER_PORT, CLIENT_PORT
-from autopts.ptsprojects.boards import tty_exists, com_to_tty
+from autopts.config import SERVER_PORT, CLIENT_PORT, MAX_SERVER_RESTART_TIME
+from autopts.ptsprojects.boards import tty_exists, com_to_tty, get_debugger_snr
 from autopts.ptsprojects.testcase_db import DATABASE_FILE
-from autopts.utils import ykush_replug_usb
+from autopts.utils import ykush_replug_usb, raise_on_global_end
+log = logging.debug
 
 
 class CliParser(argparse.ArgumentParser):
@@ -51,6 +53,9 @@ class CliParser(argparse.ArgumentParser):
         self.add_argument("-e", "--excluded", nargs='+', default=[],
                           help="Names of test cases to exclude. Groups of "
                                "test cases can be specified by profile names")
+
+        self.add_argument("--test_case_limit", nargs='?', type=int, default=0,
+                          help="Limit of test cases to run")
 
         self.add_argument("-r", "--retry", type=int, default=0,
                           help="Repeat test if failed. Parameter specifies "
@@ -82,6 +87,9 @@ class CliParser(argparse.ArgumentParser):
                           help="Specify ykush downstream port number, so on BTP TIMEOUT "
                                "the iut device could be powered off and on.")
 
+        self.add_argument("--pylink_reset", action='store_true', default=False,
+                          help="Use pylink reset.")
+
         # Hidden option to save test cases data in TestCase.db
         self.add_argument("-s", "--store", action="store_true",
                           default=False, help=argparse.SUPPRESS)
@@ -91,6 +99,13 @@ class CliParser(argparse.ArgumentParser):
 
         self.add_argument("--database-file", type=str, default=DATABASE_FILE,
                           help=argparse.SUPPRESS)
+
+        self.add_argument("--max_server_restart_time", type=int, default=MAX_SERVER_RESTART_TIME,
+                          help=argparse.SUPPRESS)
+
+        self.add_argument("--tty_alias", type=str, default='', help=argparse.SUPPRESS)
+
+        self.add_argument("--ykush_replug_delay", type=float, default=3, help=argparse.SUPPRESS)
 
         if cli_support is None:
             return
@@ -164,8 +179,24 @@ class CliParser(argparse.ArgumentParser):
 
     def check_args_tty(self, args):
         if args.ykush:
+            if args.tty_alias:
+                device_id = None
+            else:
+                device_id = args.tty_file
+
             # If ykush is used, the board could be unplugged right now
-            ykush_replug_usb(args.ykush, device_id=args.tty_file, delay=2)
+            ykush_replug_usb(args.ykush, device_id=device_id, delay=args.ykush_replug_delay)
+
+            if args.tty_alias:
+                while not os.path.islink(args.tty_alias) and not os.path.exists(os.path.realpath(args.tty_alias)):
+                    raise_on_global_end()
+                    log(f'Waiting for TTY {args.tty_alias} to appear...\n')
+                    time.sleep(1)
+
+                args.tty_file = os.path.realpath(args.tty_alias)
+
+            if args.debugger_snr is None:
+                args.debugger_snr = get_debugger_snr(args.tty_file)
 
         if not tty_exists(args.tty_file):
             return 'TTY mode: {} serial port does not exist!\n'.format(repr(args.tty_file))

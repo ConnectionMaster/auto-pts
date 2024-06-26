@@ -45,7 +45,7 @@ import win32com.server.util
 import pythoncom
 import psutil
 import logging as root_logging
-
+from datetime import datetime
 from pathlib import Path
 from autopts.ptsprojects import ptstypes
 from autopts.ptsprojects.ptstypes import E_FATAL_ERROR
@@ -333,7 +333,7 @@ class PyPTS:
 
     """
 
-    def __init__(self, device=None):
+    def __init__(self, device=None, lite_start=False):
         """Constructor"""
         log("%s", self.__init__.__name__)
 
@@ -359,6 +359,8 @@ class PyPTS:
         self._com_sender = None
         self._preferred_device = device
         self._device = None
+        self.lite_start = lite_start
+        self._last_recovery_time = datetime.now()
 
     def _init_attributes(self):
         """Initializes class attributes"""
@@ -488,6 +490,7 @@ class PyPTS:
             self._recover_item(item)
 
         self._recov_in_progress = False
+        self._last_recovery_time = datetime.now()
 
         return True
 
@@ -529,6 +532,9 @@ class PyPTS:
         log("start_pts")
 
         self._pts = win32com.client.Dispatch('ProfileTuningSuite_6.PTSControlServer')
+
+        if self.lite_start:
+            return True
 
         # The dispatched COM object cannot be passed between threads directly
         self._pts_dispatch_id = pythoncom.CoMarshalInterThreadInterfaceInStream(
@@ -595,6 +601,18 @@ class PyPTS:
                 # This is faster that ExitPTS. Moreover, the ExitPTS
                 # can fail to close the PTS due to a broken COM server.
                 try:
+                    del self._com_logger
+                    del self._com_sender
+                    del self._pts_logger
+                    del self._pts_sender
+                    del self._pts_dispatch_id
+                    del self._pts
+                    self._com_logger = None
+                    self._com_sender = None
+                    self._pts_logger = None
+                    self._pts_sender = None
+                    self._pts_dispatch_id = None
+                    self._pts = None
                     self._pts_proc.terminate()
                 except Exception as error:
                     logging.exception(repr(error))
@@ -983,6 +1001,9 @@ class PyPTS:
         """Returns PTS bluetooth address string"""
         log(self.get_bluetooth_address.__name__)
 
+        if self.lite_start:
+            return 'xxxxxxxxxxxx'
+
         address = None
         if self._device:
             # The dongle already connected. Try to read the address.
@@ -1109,3 +1130,6 @@ class PyPTS:
 
         self._pts_logger.unset_callback()
         self._pts_sender.unset_callback()
+
+    def get_last_recovery_time(self):
+        return self._last_recovery_time
